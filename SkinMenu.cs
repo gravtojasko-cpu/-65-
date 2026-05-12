@@ -104,6 +104,13 @@ namespace Oxide.Plugins
                 PrintError($"Config file is corrupted, resetting to defaults: {e.Message}");
                 LoadDefaultConfig();
             }
+
+            if (_config.SkinsPerPage < 1)
+            {
+                PrintWarning($"SkinsPerPage must be >= 1, got {_config.SkinsPerPage}. Falling back to 12.");
+                _config.SkinsPerPage = 12;
+            }
+
             SaveConfig();
         }
 
@@ -392,6 +399,7 @@ namespace Oxide.Plugins
         {
             var player = arg?.Player();
             if (player == null || !arg.HasArgs(1)) return;
+            if (!permission.UserHasPermission(player.UserIDString, PermUse)) return;
 
             var action = arg.GetString(0);
             switch (action)
