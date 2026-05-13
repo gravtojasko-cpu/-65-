@@ -51,6 +51,9 @@ namespace Oxide.Plugins
         // * (9.6 / 7.2) = width_norm * 4 / 3.
         private const float FrameSquareYPerX = 9.6f / 7.2f;
 
+        // How many category rows are visible at once in the left column.
+        private const int VisibleCategoryRows = 6;
+
         private readonly Dictionary<ulong, EditorState> _editors = new Dictionary<ulong, EditorState>();
         private readonly Dictionary<string, string> _designPng = new Dictionary<string, string>();
 
@@ -296,7 +299,10 @@ namespace Oxide.Plugins
             public Dictionary<string, ulong> Selection = new Dictionary<string, ulong>();
             public int CategoryIndex;
             public int Page;
+            public int CategoryScroll;
             public string EditingSetName;
+            public bool RefreshTimerActive;
+            public bool MenuOpen;
         }
 
         // -------------------------------------------------------------------
@@ -336,6 +342,12 @@ namespace Oxide.Plugins
             var set = data.Sets.FirstOrDefault(s =>
                 string.Equals(s.Name, "default", StringComparison.OrdinalIgnoreCase));
             if (set != null) ApplySetToInventory(player, set);
+        }
+
+        // Re-register icons if ImageLibrary is (re)loaded after us.
+        private void OnPluginLoaded(Plugin plugin)
+        {
+            if (plugin?.Name == "ImageLibrary") RegisterRemoteImages();
         }
 
         // -------------------------------------------------------------------
@@ -468,6 +480,10 @@ namespace Oxide.Plugins
                     HandleCategory(player, arg.GetInt(1, 0));
                     break;
 
+                case "cat.scroll":
+                    HandleCategoryScroll(player, arg.GetInt(1, 0));
+                    break;
+
                 case "page":
                     HandlePage(player, arg.GetInt(1, 0));
                     break;
@@ -550,7 +566,26 @@ namespace Oxide.Plugins
             var st = Editor(p);
             st.CategoryIndex = Math.Max(0, Math.Min(idx, _catalog.Categories.Count - 1));
             st.Page = 0;
+            EnsureSelectedCategoryVisible(st);
             OpenMain(p);
+        }
+
+        private void HandleCategoryScroll(BasePlayer p, int delta)
+        {
+            var st = Editor(p);
+            var maxScroll = Math.Max(0, _catalog.Categories.Count - VisibleCategoryRows);
+            st.CategoryScroll = Mathf.Clamp(st.CategoryScroll + delta, 0, maxScroll);
+            OpenMain(p);
+        }
+
+        private void EnsureSelectedCategoryVisible(EditorState st)
+        {
+            if (st.CategoryIndex < st.CategoryScroll) st.CategoryScroll = st.CategoryIndex;
+            var visible = VisibleCategoryRows;
+            if (st.CategoryIndex >= st.CategoryScroll + visible)
+                st.CategoryScroll = st.CategoryIndex - visible + 1;
+            var maxScroll = Math.Max(0, _catalog.Categories.Count - visible);
+            st.CategoryScroll = Mathf.Clamp(st.CategoryScroll, 0, maxScroll);
         }
 
         private void HandlePage(BasePlayer p, int delta)
@@ -795,7 +830,28 @@ namespace Oxide.Plugins
             CuiHelper.DestroyUi(p, MainPanel);
             CuiHelper.DestroyUi(p, ListPanel);
             CuiHelper.DestroyUi(p, PromptPanel);
+            if (_editors.TryGetValue(p.userID, out var st)) st.MenuOpen = false;
             _editors.Remove(p.userID);
+        }
+
+        // Returns true if at least one icon needed by the currently-open
+        // menu is still loading via ImageLibrary.
+        private bool AnyRequiredIconMissing(CatalogCategory cat, List<CatalogSkin> skins)
+        {
+            if (ImageLibrary == null) return false;
+
+            foreach (var c in _catalog.Categories)
+            {
+                if (string.IsNullOrEmpty(c.Icon)) continue;
+                if (RemotePng(CategoryImageKey(c.Shortname)) == null) return true;
+            }
+
+            foreach (var s in skins)
+            {
+                if (string.IsNullOrEmpty(s.IconUrl)) continue;
+                if (RemotePng(SkinImageKey(cat.Shortname, s.SkinId)) == null) return true;
+            }
+            return false;
         }
 
         private void OpenMain(BasePlayer p)
@@ -816,6 +872,8 @@ namespace Oxide.Plugins
             var totalPages = Math.Max(1, (int)Math.Ceiling(skins.Count / (double)perPage));
             st.Page = Mathf.Clamp(st.Page, 0, totalPages - 1);
 
+            EnsureSelectedCategoryVisible(st);
+
             var elements = new CuiElementContainer();
             BuildOverlay(elements);
             BuildFrame(elements);
@@ -826,6 +884,25 @@ namespace Oxide.Plugins
             BuildFooter(elements);
 
             CuiHelper.AddUi(p, elements);
+            st.MenuOpen = true;
+
+            // Auto-refresh the menu once ImageLibrary has fetched any
+            // icons that weren't ready on first render. Guard flag
+            // prevents timer pile-ups when the player clicks around
+            // while icons are still downloading.
+            if (!st.RefreshTimerActive && AnyRequiredIconMissing(category, skins))
+            {
+                st.RefreshTimerActive = true;
+                var userId = p.userID;
+                timer.Once(2f, () =>
+                {
+                    if (!_editors.TryGetValue(userId, out var current)) return;
+                    current.RefreshTimerActive = false;
+                    if (!current.MenuOpen) return;
+                    var bp = BasePlayer.FindByID(userId);
+                    if (bp != null && bp.IsConnected) OpenMain(bp);
+                });
+            }
         }
 
         // Full-screen click-blocker that holds the cursor.
@@ -882,33 +959,46 @@ namespace Oxide.Plugins
                 altColor: ColDanger, fontSize: 14);
         }
 
-        // Left column: vertical list of categories with icons.
+        // Left of the menu: a tiny scrollbar strip (up / down arrows)
+        // plus the category list. Rows have a fixed height so they
+        // stay compact regardless of how many categories exist.
         private void BuildCategoryColumn(CuiElementContainer elements, EditorState st)
         {
-            const float left = 0.03f;
-            const float right = 0.30f;
+            const float scrollLeft = 0.02f;
+            const float scrollRight = 0.06f;
+            const float catsLeft = 0.07f;
+            const float catsRight = 0.30f;
             const float top = 0.90f;
             const float bot = 0.30f;
 
+            var total = _catalog.Categories.Count;
+            var visible = Mathf.Min(VisibleCategoryRows, Mathf.Max(1, total));
+            var maxScroll = Math.Max(0, total - visible);
+            st.CategoryScroll = Mathf.Clamp(st.CategoryScroll, 0, maxScroll);
+
+            BuildCategoryScrollbar(elements, st, total, visible,
+                scrollLeft, scrollRight, top, bot);
+
+            // Wrapper panel for the list itself (helps with relative
+            // rect math + gives the column its background colour).
             elements.Add(new CuiPanel
             {
                 Image = { Color = ColSlot },
                 RectTransform =
                 {
-                    AnchorMin = Coord(left, bot),
-                    AnchorMax = Coord(right, top),
+                    AnchorMin = Coord(catsLeft, bot),
+                    AnchorMax = Coord(catsRight, top),
                 },
             }, FramePanel, FramePanel + ".cats");
 
-            var rows = _catalog.Categories.Count;
-            if (rows == 0) return;
+            if (total == 0) return;
 
             const float headerH = 0.06f;
             elements.Add(new CuiLabel
             {
                 Text =
                 {
-                    Text = "Categories", FontSize = 12,
+                    Text = "Categories", FontSize = 11,
                     Align = TextAnchor.MiddleCenter, Color = "0.85 0.85 0.85 1",
                 },
                 RectTransform =
@@ -918,18 +1008,21 @@ namespace Oxide.Plugins
                 },
             }, FramePanel + ".cats");
 
-            // Reserve top portion for header, rest is for rows.
-            var listTop = 1f - headerH;
-            var rowSpan = listTop / Mathf.Max(1, rows);
+            var listTop = 1f - headerH - 0.01f;
+            // Fixed row height (in cats-panel-normalized y units). Keeps
+            // cards compact even when there are only 2-3 categories.
+            var rowH = (listTop - 0.02f) / VisibleCategoryRows;
 
-            for (var i = 0; i < rows; i++)
+            for (var slot = 0; slot < visible; slot++)
             {
-                var rowTop = listTop - i * rowSpan;
-                var rowBot = rowTop - rowSpan + 0.005f;
-                var rowName = FramePanel + ".cats.row" + i;
+                var i = st.CategoryScroll + slot;
+                if (i >= total) break;
+
+                var rowTop = listTop - slot * rowH;
+                var rowBot = rowTop - rowH + 0.008f;
+                var rowName = FramePanel + ".cats.row" + slot;
                 var active = i == st.CategoryIndex;
 
-                // Card background: design PNG if available, else flat colour.
                 var card = DesignPng(active ? "slot_active" : "slot");
                 if (!string.IsNullOrEmpty(card))
                 {
@@ -943,7 +1036,7 @@ namespace Oxide.Plugins
                             new CuiRectTransformComponent
                             {
                                 AnchorMin = $"0.04 {rowBot}",
-                                AnchorMax = $"0.96 {rowTop - 0.005f}",
+                                AnchorMax = $"0.96 {rowTop}",
                             }
                         }
                     });
@@ -956,44 +1049,96 @@ namespace Oxide.Plugins
                         RectTransform =
                         {
                             AnchorMin = $"0.04 {rowBot}",
-                            AnchorMax = $"0.96 {rowTop - 0.005f}",
+                            AnchorMax = $"0.96 {rowTop}",
                         },
                     }, FramePanel + ".cats", rowName);
                 }
 
-                // Icon on the left of the row when ImageLibrary has it.
                 var icon = RemotePng(CategoryImageKey(_catalog.Categories[i].Shortname));
                 var hasIcon = !string.IsNullOrEmpty(icon);
                 if (hasIcon)
                 {
-                    AddRawImage(elements, rowName, icon, 0.04f, 0.10f, 0.32f, 0.90f);
+                    AddRawImage(elements, rowName, icon, 0.04f, 0.08f, 0.30f, 0.92f);
                 }
 
-                // Display label. Center it when there's no icon so the
-                // ImageLibrary "NO IMAGE FOUND" placeholder is never visible.
                 elements.Add(new CuiLabel
                 {
                     Text =
                     {
                         Text = _catalog.Categories[i].Display ?? _catalog.Categories[i].Shortname,
-                        FontSize = 13,
+                        FontSize = 11,
                         Align = hasIcon ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
                         Color = "1 1 1 1",
                     },
                     RectTransform =
                     {
-                        AnchorMin = hasIcon ? "0.36 0" : "0.05 0",
-                        AnchorMax = "0.98 1",
+                        AnchorMin = hasIcon ? "0.34 0" : "0.04 0",
+                        AnchorMax = "0.97 1",
                     },
                 }, rowName);
 
-                // Click-cover button.
                 elements.Add(new CuiButton
                 {
                     Button = { Color = ColTransparent, Command = $"skinmenu.ui category {i}" },
                     Text = { Text = string.Empty },
                     RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
                 }, rowName);
+            }
+        }
+
+        // Scroll-up + scroll-down buttons sitting on the far left of the
+        // category column. A thin track between them shows the current
+        // scroll position.
+        private void BuildCategoryScrollbar(CuiElementContainer elements, EditorState st,
+            int total, int visible,
+            float left, float right, float top, float bot)
+        {
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = ColSlot },
+                RectTransform =
+                {
+                    AnchorMin = Coord(left, bot),
+                    AnchorMax = Coord(right, top),
+                },
+            }, FramePanel, FramePanel + ".scroll");
+
+            var canScroll = total > visible;
+            var upCmd = canScroll ? "skinmenu.ui cat.scroll -1" : "";
+            var downCmd = canScroll ? "skinmenu.ui cat.scroll 1" : "";
+
+            // Up arrow at the top.
+            AddStyledButton(elements, FramePanel + ".scroll", "\u25B2", upCmd,
+                0.05f, 0.88f, 0.95f, 0.97f, fontSize: 12, altColor: ColTransparent);
+            // Down arrow at the bottom.
+            AddStyledButton(elements, FramePanel + ".scroll", "\u25BC", downCmd,
+                0.05f, 0.03f, 0.95f, 0.12f, fontSize: 12, altColor: ColTransparent);
+
+            // Track background.
+            elements.Add(new CuiPanel
+            {
+                Image = { Color = "0.10 0.11 0.13 0.9" },
+                RectTransform = { AnchorMin = "0.30 0.13", AnchorMax = "0.70 0.87" },
+            }, FramePanel + ".scroll");
+
+            // Scroll position indicator (thumb).
+            if (canScroll)
+            {
+                var trackLen = 0.74f; // 0.87 - 0.13
+                var thumbLen = trackLen * ((float)visible / total);
+                var maxScroll = Math.Max(1, total - visible);
+                var posFromTop = (float)st.CategoryScroll / maxScroll;
+                var thumbTop = 0.87f - posFromTop * (trackLen - thumbLen);
+                var thumbBot = thumbTop - thumbLen;
+                elements.Add(new CuiPanel
+                {
+                    Image = { Color = ColAccent },
+                    RectTransform =
+                    {
+                        AnchorMin = $"0.32 {thumbBot}",
+                        AnchorMax = $"0.68 {thumbTop}",
+                    },
+                }, FramePanel + ".scroll");
             }
         }
 
