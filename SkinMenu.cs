@@ -1603,7 +1603,11 @@ namespace Oxide.Plugins
 
             foreach (var s in dir.skins)
             {
-                if (s == null || s.Item == null || s.Id == 0) continue;
+                // ItemSkinDirectory.Skin is a struct in current builds,
+                // so a `s == null` check would not compile. The Item
+                // reference inside the struct is what we actually need
+                // to validate.
+                if (s.Item == null || s.Id == 0) continue;
                 var shortname = s.Item.shortname;
                 if (filter != null && !filter.Contains(shortname)) continue;
 
