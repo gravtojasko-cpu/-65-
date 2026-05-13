@@ -85,17 +85,28 @@ Available from chat (`/skinmenu.import ...`) and server / RCON
 console (`skinmenu.import ...`). Requires the `skinmenu.admin`
 permission (auto-passes for `IsAdmin` flagged players).
 
-Approved skins are read straight from `ItemSkinDirectory` and their
-workshop preview URLs come from the **public**
-`ISteamRemoteStorage/GetPublishedFileDetails` endpoint — no Steam API
-key required. To pull pending workshop submissions you need a free
-[Steam Web API key](https://steamcommunity.com/dev/apikey) saved in
-the config under `SteamWebApiKey`. Without it, `pending` / `all` fall
-back to `approved` (with a warning in chat / console).
+**All three modes go through the Steam Workshop API** (not
+`ItemSkinDirectory`), so the import never picks up DLC content or
+other bundled-with-the-game skins. Required server-side filter:
+`requiredtags=Skin`. Items are mapped to in-game shortnames via their
+workshop tags (e.g. tag `AK-47` → `rifle.ak`); items with no
+recognisable item tag are ignored. Approval status comes from the
+Steam query type:
+
+| Mode      | Steam endpoint                                              |
+| --------- | ----------------------------------------------------------- |
+| `approved`| `IPublishedFileService/QueryFiles` `query_type=2` (AcceptedForGameRankedByAcceptanceDate) |
+| `all`     | `query_type=2` ∪ `query_type=1`                             |
+| `pending` | `query_type=1` ∖ `query_type=2`                             |
+
+A **Steam Web API key is required** for every mode (it's free — get
+one in ~1 minute at https://steamcommunity.com/dev/apikey) and goes
+into `"Steam Web API key ..."` in `oxide/config/SkinMenu.json`.
+Without it the command refuses to run with a clear message.
 
 After the import finishes the new catalog is written to
 `oxide/data/SkinMenu/skins.json`, the in-memory catalog is hot-reloaded
-and all icon URLs are queued in `ImageLibrary`.
+and all preview URLs are queued in `ImageLibrary`.
 
 ### Modes
 
