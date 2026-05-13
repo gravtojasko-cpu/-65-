@@ -29,6 +29,7 @@ using Oxide.Core;
 using Oxide.Core.Plugins;
 using Oxide.Game.Rust.Cui;
 using UnityEngine;
+using UnityEngine.UI;
 
 namespace Oxide.Plugins
 {
@@ -359,31 +360,10 @@ namespace Oxide.Plugins
             if (plugin?.Name == "ImageLibrary") RegisterRemoteImages();
         }
 
-        // Rust CUI has no native mouse-wheel events, so we hook the
-        // hotbar active-slot change instead: rolling the wheel cycles
-        // the active hotbar slot one step at a time (with 5 -> 0 / 0
-        // -> 5 wrap-around). Multi-step jumps (1-6 key presses) are
-        // ignored, so the player can still pick a specific slot
-        // without scrolling categories. Wheel direction is forwarded
-        // to HandleCategoryScroll (left-hand category list).
-        private void OnActiveItemChanged(BasePlayer player, Item oldItem, Item newItem)
-        {
-            if (player == null) return;
-            if (!_editors.TryGetValue(player.userID, out var st) || !st.MenuOpen) return;
-            if (!permission.UserHasPermission(player.UserIDString, PermUse)) return;
+        // Note: native CuiScrollViewComponent on the category column
+        // gives us real mouse-wheel scrolling, so we no longer need
+        // the OnActiveItemChanged / hotbar-slot hack that lived here.
 
-            int oldSlot = oldItem?.position ?? -1;
-            int newSlot = newItem?.position ?? -1;
-            if (oldSlot < 0 || newSlot < 0 || oldSlot == newSlot) return;
-
-            int delta = newSlot - oldSlot;
-            int dir;
-            if (delta == 1 || delta == -5) dir = 1;
-            else if (delta == -1 || delta == 5) dir = -1;
-            else return; // multi-step change = key press, not wheel
-
-            HandleCategoryScroll(player, dir);
-        }
 
         // -------------------------------------------------------------------
         // Image loading
@@ -515,10 +495,6 @@ namespace Oxide.Plugins
                     HandleCategory(player, arg.GetInt(1, 0));
                     break;
 
-                case "cat.scroll":
-                    HandleCategoryScroll(player, arg.GetInt(1, 0));
-                    break;
-
                 case "page":
                     HandlePage(player, arg.GetInt(1, 0));
                     break;
@@ -609,23 +585,11 @@ namespace Oxide.Plugins
             OpenMain(p);
         }
 
-        private void HandleCategoryScroll(BasePlayer p, int delta)
-        {
-            var st = Editor(p);
-            var maxScroll = Math.Max(0, _catalog.Categories.Count - VisibleCategoryRows);
-            st.CategoryScroll = Mathf.Clamp(st.CategoryScroll + delta, 0, maxScroll);
-            OpenMain(p);
-        }
-
-        private void EnsureSelectedCategoryVisible(EditorState st)
-        {
-            if (st.CategoryIndex < st.CategoryScroll) st.CategoryScroll = st.CategoryIndex;
-            var visible = VisibleCategoryRows;
-            if (st.CategoryIndex >= st.CategoryScroll + visible)
-                st.CategoryScroll = st.CategoryIndex - visible + 1;
-            var maxScroll = Math.Max(0, _catalog.Categories.Count - visible);
-            st.CategoryScroll = Mathf.Clamp(st.CategoryScroll, 0, maxScroll);
-        }
+        // No-op kept for API compatibility with older saved player
+        // states that still reference CategoryScroll. The category
+        // list is now a real ScrollView (CuiScrollViewComponent),
+        // so server-side scroll bookkeeping isn't required.
+        private void EnsureSelectedCategoryVisible(EditorState st) { }
 
         // Wheel-driven delta paging: scrolls within the current
         // category and wraps into adjacent categories at the edges.
@@ -1058,41 +1022,33 @@ namespace Oxide.Plugins
                 altColor: ColDanger, fontSize: 14);
         }
 
-        // Left of the menu: a tiny scrollbar strip (up / down arrows)
-        // plus the category list. Rows have a fixed height so they
-        // stay compact regardless of how many categories exist.
+        // Left column = a real CuiScrollViewComponent. Rolling the
+        // mouse wheel scrolls the list natively (no need for arrow
+        // buttons). Row height is fixed at 1/VisibleCategoryRows of
+        // the visible area, so the list stays compact when there
+        // are only a few categories and overflows nicely when there
+        // are many.
         private void BuildCategoryColumn(CuiElementContainer elements, EditorState st)
         {
-            const float scrollLeft = 0.02f;
-            const float scrollRight = 0.06f;
-            const float catsLeft = 0.07f;
-            const float catsRight = 0.30f;
-            const float top = 0.90f;
-            const float bot = 0.30f;
+            const float colLeft = 0.02f;
+            const float colRight = 0.30f;
+            const float colTop = 0.90f;
+            const float colBot = 0.30f;
+            const float headerH = 0.06f;
 
-            var total = _catalog.Categories.Count;
-            var visible = Mathf.Min(VisibleCategoryRows, Mathf.Max(1, total));
-            var maxScroll = Math.Max(0, total - visible);
-            st.CategoryScroll = Mathf.Clamp(st.CategoryScroll, 0, maxScroll);
-
-            BuildCategoryScrollbar(elements, st, total, visible,
-                scrollLeft, scrollRight, top, bot);
-
-            // Wrapper panel for the list itself (helps with relative
-            // rect math + gives the column its background colour).
             elements.Add(new CuiPanel
             {
                 Image = { Color = ColSlot },
                 RectTransform =
                 {
-                    AnchorMin = Coord(catsLeft, bot),
-                    AnchorMax = Coord(catsRight, top),
+                    AnchorMin = Coord(colLeft, colBot),
+                    AnchorMax = Coord(colRight, colTop),
                 },
             }, FramePanel, FramePanel + ".cats");
 
+            var total = _catalog.Categories.Count;
             if (total == 0) return;
 
-            const float headerH = 0.06f;
             elements.Add(new CuiLabel
             {
                 Text =
@@ -1107,138 +1063,127 @@ namespace Oxide.Plugins
                 },
             }, FramePanel + ".cats");
 
-            var listTop = 1f - headerH - 0.01f;
-            // Fixed row height (in cats-panel-normalized y units). Keeps
-            // cards compact even when there are only 2-3 categories.
-            var rowH = (listTop - 0.02f) / VisibleCategoryRows;
+            var scrollName = FramePanel + ".cats.scroll";
+            // Content is sized so each row is 1/VisibleCategoryRows of
+            // the visible area: a contentScale of 1.0 means "fits in
+            // viewport, no scroll needed". Anything beyond extends
+            // below the viewport and is reachable via the wheel.
+            float contentScale = Math.Max(1f, (float)total / VisibleCategoryRows);
+            float contentAnchorMinY = 1f - contentScale;
 
-            for (var slot = 0; slot < visible; slot++)
+            elements.Add(new CuiElement
             {
-                var i = st.CategoryScroll + slot;
-                if (i >= total) break;
-
-                var rowTop = listTop - slot * rowH;
-                var rowBot = rowTop - rowH + 0.008f;
-                var rowName = FramePanel + ".cats.row" + slot;
-                var active = i == st.CategoryIndex;
-
-                var card = DesignPng(active ? "slot_active" : "slot");
-                if (!string.IsNullOrEmpty(card))
+                Name = scrollName,
+                Parent = FramePanel + ".cats",
+                DestroyUi = scrollName,
+                Components =
                 {
-                    elements.Add(new CuiElement
+                    new CuiScrollViewComponent
                     {
-                        Parent = FramePanel + ".cats",
-                        Name = rowName,
-                        Components =
+                        Vertical = true,
+                        Horizontal = false,
+                        MovementType = ScrollRect.MovementType.Clamped,
+                        Inertia = true,
+                        ScrollSensitivity = 30f,
+                        ContentTransform = new CuiRectTransform
                         {
-                            new CuiRawImageComponent { Png = card, Color = "1 1 1 1" },
-                            new CuiRectTransformComponent
-                            {
-                                AnchorMin = $"0.04 {rowBot}",
-                                AnchorMax = $"0.96 {rowTop}",
-                            }
-                        }
-                    });
-                }
-                else
-                {
-                    elements.Add(new CuiPanel
-                    {
-                        Image = { Color = active ? ColAccentSoft : ColRow },
-                        RectTransform =
-                        {
-                            AnchorMin = $"0.04 {rowBot}",
-                            AnchorMax = $"0.96 {rowTop}",
+                            AnchorMin = "0 " + contentAnchorMinY.ToString("0.####",
+                                System.Globalization.CultureInfo.InvariantCulture),
+                            AnchorMax = "1 1",
+                            OffsetMin = "0 0",
+                            OffsetMax = "0 0",
                         },
-                    }, FramePanel + ".cats", rowName);
-                }
-
-                var icon = RemotePng(CategoryImageKey(_catalog.Categories[i].Shortname));
-                var hasIcon = !string.IsNullOrEmpty(icon);
-                if (hasIcon)
-                {
-                    AddRawImage(elements, rowName, icon, 0.04f, 0.08f, 0.30f, 0.92f);
-                }
-
-                elements.Add(new CuiLabel
-                {
-                    Text =
-                    {
-                        Text = _catalog.Categories[i].Display ?? _catalog.Categories[i].Shortname,
-                        FontSize = 11,
-                        Align = hasIcon ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
-                        Color = "1 1 1 1",
                     },
-                    RectTransform =
+                    new CuiImageComponent { Color = ColTransparent },
+                    new CuiRectTransformComponent
                     {
-                        AnchorMin = hasIcon ? "0.34 0" : "0.04 0",
-                        AnchorMax = "0.97 1",
-                    },
-                }, rowName);
+                        AnchorMin = "0.02 0.01",
+                        AnchorMax = "0.98 " + (1f - headerH - 0.005f).ToString("0.####",
+                            System.Globalization.CultureInfo.InvariantCulture),
+                    }
+                }
+            });
 
-                elements.Add(new CuiButton
-                {
-                    Button = { Color = ColTransparent, Command = $"skinmenu.ui category {i}" },
-                    Text = { Text = string.Empty },
-                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                }, rowName);
+            // Each row occupies 1/(VisibleCategoryRows*contentScale)
+            // of CONTENT height. With contentScale = total/visible
+            // this resolves to 1/total of content; in pixels every
+            // row is the same size in or out of view.
+            float slotsInContent = VisibleCategoryRows * contentScale;
+            for (var i = 0; i < total; i++)
+            {
+                var yTop = 1f - i / slotsInContent;
+                var yBot = 1f - (i + 1) / slotsInContent;
+                BuildCategoryRow(elements, st, scrollName, i, yBot + 0.004f, yTop - 0.004f);
             }
         }
 
-        // Scroll-up + scroll-down buttons sitting on the far left of the
-        // category column. A thin track between them shows the current
-        // scroll position.
-        private void BuildCategoryScrollbar(CuiElementContainer elements, EditorState st,
-            int total, int visible,
-            float left, float right, float top, float bot)
+        private void BuildCategoryRow(CuiElementContainer elements, EditorState st,
+            string parent, int i, float yBot, float yTop)
         {
-            elements.Add(new CuiPanel
+            var cat = _catalog.Categories[i];
+            var rowName = parent + ".row" + i;
+            var active = i == st.CategoryIndex;
+
+            var card = DesignPng(active ? "slot_active" : "slot");
+            if (!string.IsNullOrEmpty(card))
             {
-                Image = { Color = ColSlot },
-                RectTransform =
+                elements.Add(new CuiElement
                 {
-                    AnchorMin = Coord(left, bot),
-                    AnchorMax = Coord(right, top),
-                },
-            }, FramePanel, FramePanel + ".scroll");
-
-            var canScroll = total > visible;
-            var upCmd = canScroll ? "skinmenu.ui cat.scroll -1" : "";
-            var downCmd = canScroll ? "skinmenu.ui cat.scroll 1" : "";
-
-            // Up arrow at the top.
-            AddStyledButton(elements, FramePanel + ".scroll", "\u25B2", upCmd,
-                0.05f, 0.88f, 0.95f, 0.97f, fontSize: 12, altColor: ColTransparent);
-            // Down arrow at the bottom.
-            AddStyledButton(elements, FramePanel + ".scroll", "\u25BC", downCmd,
-                0.05f, 0.03f, 0.95f, 0.12f, fontSize: 12, altColor: ColTransparent);
-
-            // Track background.
-            elements.Add(new CuiPanel
+                    Parent = parent,
+                    Name = rowName,
+                    Components =
+                    {
+                        new CuiRawImageComponent { Png = card, Color = "1 1 1 1" },
+                        new CuiRectTransformComponent
+                        {
+                            AnchorMin = $"0.04 {yBot:0.####}",
+                            AnchorMax = $"0.96 {yTop:0.####}",
+                        }
+                    }
+                });
+            }
+            else
             {
-                Image = { Color = "0.10 0.11 0.13 0.9" },
-                RectTransform = { AnchorMin = "0.30 0.13", AnchorMax = "0.70 0.87" },
-            }, FramePanel + ".scroll");
-
-            // Scroll position indicator (thumb).
-            if (canScroll)
-            {
-                var trackLen = 0.74f; // 0.87 - 0.13
-                var thumbLen = trackLen * ((float)visible / total);
-                var maxScroll = Math.Max(1, total - visible);
-                var posFromTop = (float)st.CategoryScroll / maxScroll;
-                var thumbTop = 0.87f - posFromTop * (trackLen - thumbLen);
-                var thumbBot = thumbTop - thumbLen;
                 elements.Add(new CuiPanel
                 {
-                    Image = { Color = ColAccent },
+                    Image = { Color = active ? ColAccentSoft : ColRow },
                     RectTransform =
                     {
-                        AnchorMin = $"0.32 {thumbBot}",
-                        AnchorMax = $"0.68 {thumbTop}",
+                        AnchorMin = $"0.04 {yBot:0.####}",
+                        AnchorMax = $"0.96 {yTop:0.####}",
                     },
-                }, FramePanel + ".scroll");
+                }, parent, rowName);
             }
+
+            var icon = RemotePng(CategoryImageKey(cat.Shortname));
+            var hasIcon = !string.IsNullOrEmpty(icon);
+            if (hasIcon)
+            {
+                AddRawImage(elements, rowName, icon, 0.04f, 0.08f, 0.30f, 0.92f);
+            }
+
+            elements.Add(new CuiLabel
+            {
+                Text =
+                {
+                    Text = cat.Display ?? cat.Shortname,
+                    FontSize = 11,
+                    Align = hasIcon ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
+                    Color = "1 1 1 1",
+                },
+                RectTransform =
+                {
+                    AnchorMin = hasIcon ? "0.34 0" : "0.04 0",
+                    AnchorMax = "0.97 1",
+                },
+            }, rowName);
+
+            elements.Add(new CuiButton
+            {
+                Button = { Color = ColTransparent, Command = $"skinmenu.ui category {i}" },
+                Text = { Text = string.Empty },
+                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+            }, rowName);
         }
 
         // Right side: 4-column square skin grid with pagination arrows.
