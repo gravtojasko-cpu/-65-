@@ -24,10 +24,13 @@ using System.IO;
 using System.Linq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using Newtonsoft.Json.Linq;
 using Oxide.Core;
+using Oxide.Core.Libraries;
 using Oxide.Core.Plugins;
 using Oxide.Game.Rust.Cui;
 using UnityEngine;
+using System.Text;
 
 namespace Oxide.Plugins
 {
@@ -43,6 +46,7 @@ namespace Oxide.Plugins
         private const string PromptPanel = "skinmenu.prompt";
 
         private const string PermUse = "skinmenu.use";
+        private const string PermAdmin = "skinmenu.admin";
 
         // Inner frame occupies 60% width x 80% height of the screen.
         // Within that frame, 1 unit of x covers 0.6 * 16 = 9.6 visual
@@ -77,6 +81,12 @@ namespace Oxide.Plugins
 
             [JsonProperty("Auto-apply set on respawn if a set is named 'default'")]
             public bool ApplyDefaultOnRespawn = true;
+
+            [JsonProperty("Apply the picked skin to matching inventory items immediately")]
+            public bool ApplyOnPick = true;
+
+            [JsonProperty("Steam Web API key (optional, only required for 'pending'/'all' workshop imports)")]
+            public string SteamWebApiKey = string.Empty;
 
             [JsonProperty("Design image file names (placed in oxide/data/SkinMenu/design/)")]
             public DesignImages Design = new DesignImages();
@@ -312,6 +322,7 @@ namespace Oxide.Plugins
         private void Init()
         {
             permission.RegisterPermission(PermUse, this);
+            permission.RegisterPermission(PermAdmin, this);
             EnsureDataDirs();
             LoadCatalog();
         }
@@ -602,7 +613,30 @@ namespace Oxide.Plugins
         {
             var st = Editor(p);
             st.Selection[shortname] = skinId;
+            if (_config.ApplyOnPick) ApplySingleSkin(p, shortname, skinId);
             OpenMain(p);
+        }
+
+        // Push a single skin to every matching item the player has on them.
+        private void ApplySingleSkin(BasePlayer p, string shortname, ulong skinId)
+        {
+            if (p == null || p.inventory == null || string.IsNullOrEmpty(shortname)) return;
+            foreach (var container in new[] { p.inventory.containerMain, p.inventory.containerBelt, p.inventory.containerWear })
+            {
+                if (container == null) continue;
+                foreach (var item in container.itemList)
+                {
+                    if (item?.info == null || item.info.shortname != shortname) continue;
+                    item.skin = skinId;
+                    item.MarkDirty();
+                    var held = item.GetHeldEntity();
+                    if (held != null)
+                    {
+                        held.skinID = skinId;
+                        held.SendNetworkUpdate();
+                    }
+                }
+            }
         }
 
         private void HandleCreate(BasePlayer p, string name)
@@ -1442,6 +1476,389 @@ namespace Oxide.Plugins
             }, PromptPanel + ".inner");
 
             CuiHelper.AddUi(p, elements);
+        }
+
+        // -------------------------------------------------------------------
+        // Admin: auto-import skins from in-game directory + Steam Workshop
+        // -------------------------------------------------------------------
+
+        private const int WorkshopBatchSize = 50;
+        private bool _importInProgress;
+
+        private class ImportSkin
+        {
+            public ulong SkinId;
+            public string ItemShortname;
+            public string ItemDisplay;
+            public string Name;
+            public string IconUrl;
+            public bool Approved;
+        }
+
+        // /skinmenu.import <approved|all|pending> [shortname1 shortname2 ...]
+        [ChatCommand("skinmenu.import")]
+        private void CmdImportChat(BasePlayer player, string command, string[] args)
+        {
+            if (!IsAdminLike(player))
+            {
+                player.ChatMessage("You don't have permission to use skinmenu.import.");
+                return;
+            }
+            RunImport(player, args ?? Array.Empty<string>());
+        }
+
+        [ConsoleCommand("skinmenu.import")]
+        private void CmdImportConsole(ConsoleSystem.Arg arg)
+        {
+            var caller = arg?.Player();
+            if (caller != null && !IsAdminLike(caller))
+            {
+                caller.ChatMessage("You don't have permission to use skinmenu.import.");
+                return;
+            }
+
+            var args = new List<string>();
+            for (int i = 0; arg != null && arg.HasArgs(i + 1); i++) args.Add(arg.GetString(i));
+            RunImport(caller, args.ToArray());
+        }
+
+        private bool IsAdminLike(BasePlayer p)
+        {
+            if (p == null) return true; // server console
+            return p.IsAdmin || permission.UserHasPermission(p.UserIDString, PermAdmin);
+        }
+
+        private void Notify(BasePlayer admin, string message)
+        {
+            if (admin != null) admin.ChatMessage(message);
+            Puts(message);
+        }
+
+        private void RunImport(BasePlayer admin, string[] args)
+        {
+            if (_importInProgress)
+            {
+                Notify(admin, "[SkinMenu] An import is already running, please wait.");
+                return;
+            }
+
+            var mode = (args.Length > 0 ? args[0] : "approved").ToLowerInvariant();
+            HashSet<string> filter = null;
+            if (args.Length > 1)
+            {
+                filter = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 1; i < args.Length; i++) filter.Add(args[i]);
+            }
+
+            if (mode == "nonapproved") mode = "pending";
+            if (!(mode == "approved" || mode == "all" || mode == "pending"))
+            {
+                Notify(admin, "[SkinMenu] Usage: /skinmenu.import <approved|all|pending> [shortname ...]");
+                return;
+            }
+
+            _importInProgress = true;
+            Notify(admin, $"[SkinMenu] Import started (mode={mode}).");
+
+            var approved = CollectApprovedSkins(filter);
+            Notify(admin, $"[SkinMenu] Found {approved.Count} approved skins in ItemSkinDirectory.");
+
+            // Pending/all paths require the Steam Web API key to enumerate
+            // un-approved workshop submissions.
+            var needsWorkshop = mode == "pending" || mode == "all";
+            if (needsWorkshop && string.IsNullOrEmpty(_config.SteamWebApiKey))
+            {
+                Notify(admin, "[SkinMenu] WARNING: 'pending'/'all' modes need SteamWebApiKey in config. " +
+                              "Falling back to approved-only.");
+                needsWorkshop = false;
+            }
+
+            if (mode == "pending")
+            {
+                if (!needsWorkshop)
+                {
+                    Notify(admin, "[SkinMenu] No Steam API key; nothing to import for pending mode.");
+                    _importInProgress = false;
+                    return;
+                }
+                FetchPendingFromWorkshop(admin, new List<ImportSkin>(), filter, mode);
+                return;
+            }
+
+            if (mode == "all" && needsWorkshop)
+            {
+                FetchPendingFromWorkshop(admin, approved, filter, mode);
+                return;
+            }
+
+            // mode == "approved" or workshop-disabled fallback
+            FetchIconsThenSave(admin, approved, mode);
+        }
+
+        private List<ImportSkin> CollectApprovedSkins(HashSet<string> filter)
+        {
+            var result = new List<ImportSkin>();
+            var dir = ItemSkinDirectory.Instance;
+            if (dir == null || dir.skins == null) return result;
+
+            foreach (var s in dir.skins)
+            {
+                if (s == null || s.Item == null || s.Id == 0) continue;
+                var shortname = s.Item.shortname;
+                if (filter != null && !filter.Contains(shortname)) continue;
+
+                var skinName = s.invItem?.displayName?.english
+                               ?? s.invItem?.name
+                               ?? s.Id.ToString();
+
+                result.Add(new ImportSkin
+                {
+                    SkinId = (ulong)s.Id,
+                    ItemShortname = shortname,
+                    ItemDisplay = s.Item.displayName?.english ?? shortname,
+                    Name = skinName,
+                    Approved = true,
+                });
+            }
+            return result;
+        }
+
+        // Batch-fetch preview URLs from the public Steam endpoint
+        // (no API key required) and then finalise the catalog.
+        private void FetchIconsThenSave(BasePlayer admin, List<ImportSkin> skins, string mode)
+        {
+            if (skins.Count == 0)
+            {
+                Notify(admin, "[SkinMenu] Nothing to import.");
+                _importInProgress = false;
+                return;
+            }
+
+            var batches = new List<List<ulong>>();
+            for (int i = 0; i < skins.Count; i += WorkshopBatchSize)
+                batches.Add(skins.Skip(i).Take(WorkshopBatchSize).Select(s => s.SkinId).ToList());
+
+            var icons = new Dictionary<ulong, string>();
+            // Wrap counter in an array so the closure can decrement it.
+            // (Oxide invokes web callbacks on the main thread sequentially,
+            //  so plain decrement is safe.)
+            var remaining = new int[] { batches.Count };
+            Notify(admin, $"[SkinMenu] Fetching {skins.Count} icons in {batches.Count} batch(es)...");
+
+            foreach (var batch in batches)
+            {
+                var body = new StringBuilder();
+                body.Append("itemcount=").Append(batch.Count);
+                for (int j = 0; j < batch.Count; j++)
+                    body.Append("&publishedfileids[").Append(j).Append("]=").Append(batch[j]);
+
+                webrequest.Enqueue(
+                    "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+                    body.ToString(),
+                    (code, response) =>
+                    {
+                        ParseDetailsResponse(code, response, icons);
+                        remaining[0]--;
+                        if (remaining[0] == 0) FinalizeImport(admin, skins, icons, mode);
+                    },
+                    this,
+                    RequestMethod.POST,
+                    new Dictionary<string, string> { ["Content-Type"] = "application/x-www-form-urlencoded" });
+            }
+        }
+
+        private static void ParseDetailsResponse(int code, string response, Dictionary<ulong, string> icons)
+        {
+            if (code != 200 || string.IsNullOrEmpty(response)) return;
+            try
+            {
+                var json = JObject.Parse(response);
+                var details = json["response"]?["publishedfiledetails"] as JArray;
+                if (details == null) return;
+                foreach (var d in details)
+                {
+                    var idStr = d["publishedfileid"]?.ToString();
+                    var preview = d["preview_url"]?.ToString();
+                    if (ulong.TryParse(idStr, out var id) && !string.IsNullOrEmpty(preview))
+                        icons[id] = preview;
+                }
+            }
+            catch (Exception)
+            {
+                // Per-batch parse errors are non-fatal; we just lose those icons.
+            }
+        }
+
+        // Walk pages of IPublishedFileService/QueryFiles to collect
+        // un-approved workshop submissions and merge them into the
+        // import set. Requires SteamWebApiKey in config.
+        private void FetchPendingFromWorkshop(BasePlayer admin, List<ImportSkin> approved,
+            HashSet<string> filter, string mode)
+        {
+            var key = _config.SteamWebApiKey;
+            var combined = new List<ImportSkin>(approved);
+            var seen = new HashSet<ulong>(approved.Select(s => s.SkinId));
+            var displayMap = BuildDisplayNameMap();
+            var maxPages = 50; // safety cap (~5000 entries)
+
+            void FetchPage(int page)
+            {
+                if (page > maxPages)
+                {
+                    FetchIconsThenSave(admin, combined, mode);
+                    return;
+                }
+
+                var url = $"https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/" +
+                          $"?key={key}&appid=252490&query_type=1&numperpage=100&page={page}" +
+                          $"&return_tags=1&return_metadata=1&match_all_tags=0";
+
+                webrequest.Enqueue(url, null, (code, response) =>
+                {
+                    if (code != 200)
+                    {
+                        Notify(admin, $"[SkinMenu] QueryFiles HTTP {code} on page {page}; stopping.");
+                        FetchIconsThenSave(admin, combined, mode);
+                        return;
+                    }
+
+                    int addedThisPage = 0;
+                    try
+                    {
+                        var json = JObject.Parse(response);
+                        var files = json["response"]?["publishedfiledetails"] as JArray;
+                        if (files == null || files.Count == 0)
+                        {
+                            FetchIconsThenSave(admin, combined, mode);
+                            return;
+                        }
+
+                        foreach (var f in files)
+                        {
+                            var idStr = f["publishedfileid"]?.ToString();
+                            if (!ulong.TryParse(idStr, out var skinId) || skinId == 0) continue;
+                            if (!seen.Add(skinId)) continue;
+
+                            var title = f["title"]?.ToString() ?? skinId.ToString();
+                            var preview = f["preview_url"]?.ToString();
+                            var tags = f["tags"] as JArray;
+
+                            string shortname = null;
+                            string displayName = null;
+                            if (tags != null)
+                            {
+                                foreach (var t in tags)
+                                {
+                                    var tagName = t["tag"]?.ToString();
+                                    if (string.IsNullOrEmpty(tagName)) continue;
+                                    if (displayMap.TryGetValue(tagName, out var def))
+                                    {
+                                        shortname = def.shortname;
+                                        displayName = tagName;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (shortname == null) continue;
+                            if (filter != null && !filter.Contains(shortname)) continue;
+
+                            combined.Add(new ImportSkin
+                            {
+                                SkinId = skinId,
+                                ItemShortname = shortname,
+                                ItemDisplay = displayName,
+                                Name = title,
+                                IconUrl = preview,
+                                Approved = false,
+                            });
+                            addedThisPage++;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Notify(admin, $"[SkinMenu] QueryFiles parse error: {e.Message}");
+                        FetchIconsThenSave(admin, combined, mode);
+                        return;
+                    }
+
+                    if (addedThisPage == 0)
+                    {
+                        FetchIconsThenSave(admin, combined, mode);
+                        return;
+                    }
+
+                    Notify(admin, $"[SkinMenu] Page {page}: pending so far = {combined.Count - approved.Count}.");
+                    FetchPage(page + 1);
+                }, this);
+            }
+
+            FetchPage(1);
+        }
+
+        private static Dictionary<string, ItemDefinition> BuildDisplayNameMap()
+        {
+            var map = new Dictionary<string, ItemDefinition>(StringComparer.OrdinalIgnoreCase);
+            foreach (var def in ItemManager.GetItemDefinitions())
+            {
+                if (def == null) continue;
+                var name = def.displayName?.english;
+                if (!string.IsNullOrEmpty(name)) map[name] = def;
+                map[def.shortname] = def;
+            }
+            return map;
+        }
+
+        // Apply icon URLs to skin records that don't already have one
+        // (workshop entries already carry preview_url from QueryFiles),
+        // group everything by item shortname and persist the new catalog.
+        private void FinalizeImport(BasePlayer admin, List<ImportSkin> skins,
+            Dictionary<ulong, string> icons, string mode)
+        {
+            foreach (var s in skins)
+            {
+                if (string.IsNullOrEmpty(s.IconUrl) && icons.TryGetValue(s.SkinId, out var url))
+                    s.IconUrl = url;
+            }
+
+            var newCatalog = new Catalog();
+            foreach (var group in skins.Where(s => !string.IsNullOrEmpty(s.ItemShortname))
+                                       .GroupBy(s => s.ItemShortname)
+                                       .OrderBy(g => g.Key))
+            {
+                var first = group.First();
+                newCatalog.Categories.Add(new CatalogCategory
+                {
+                    Shortname = group.Key,
+                    Display = first.ItemDisplay ?? group.Key,
+                    Icon = $"https://rustlabs.com/img/items180/{group.Key}.png",
+                    Skins = group
+                        .OrderByDescending(s => s.Approved)
+                        .ThenBy(s => s.Name)
+                        .Select(s => new CatalogSkin
+                        {
+                            SkinId = s.SkinId,
+                            Name = s.Name,
+                            IconUrl = s.IconUrl,
+                            Approved = s.Approved,
+                        }).ToList(),
+                });
+            }
+
+            try
+            {
+                _catalog = newCatalog;
+                File.WriteAllText(DataCatalog, JsonConvert.SerializeObject(_catalog, Formatting.Indented));
+                RegisterRemoteImages();
+                Notify(admin, $"[SkinMenu] Import complete: {skins.Count} skins across {newCatalog.Categories.Count} categories. Saved to {DataCatalog}.");
+            }
+            catch (Exception e)
+            {
+                Notify(admin, $"[SkinMenu] Failed to save catalog: {e.Message}");
+            }
+            finally
+            {
+                _importInProgress = false;
+            }
         }
     }
 }

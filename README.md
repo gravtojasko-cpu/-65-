@@ -36,14 +36,16 @@ loaded through `ImageLibrary`.
 
 ## Permissions
 
-| Permission       | Effect                          |
-| ---------------- | ------------------------------- |
-| `skinmenu.use`   | Allows opening the menu (`/skinmenu`). |
+| Permission        | Effect                                                |
+| ----------------- | ----------------------------------------------------- |
+| `skinmenu.use`    | Allows opening the menu (`/skinmenu`).                |
+| `skinmenu.admin`  | Allows running `/skinmenu.import` (server owner / admins). |
 
 Grant with:
 
 ```
 o.grant group default skinmenu.use
+o.grant user <your-steamid> skinmenu.admin
 ```
 
 ## Config
@@ -52,8 +54,10 @@ o.grant group default skinmenu.use
 {
   "Command to open the menu": "skinmenu",
   "Skin catalog mode (All / Approved / Pending)": "Approved",
-  "How many skins per page in the grid": 12,
+  "How many skins per page in the grid": 8,
   "Auto-apply set on respawn if a set is named 'default'": true,
+  "Apply the picked skin to matching inventory items immediately": true,
+  "Steam Web API key (optional, only required for 'pending'/'all' workshop imports)": "",
   "Design image file names (placed in oxide/data/SkinMenu/design/)": {
     "Main panel background": "bg.png",
     "Skin slot frame": "slot.png",
@@ -63,6 +67,35 @@ o.grant group default skinmenu.use
   }
 }
 ```
+
+## Auto-import skins (admin)
+
+Manually editing `skins.json` is tedious — use the built-in admin
+command to populate the catalog automatically:
+
+```
+/skinmenu.import approved              # every approved skin in the game
+/skinmenu.import approved rifle.ak     # only the AK
+/skinmenu.import approved rifle.ak hoodie pants  # whitelist multiple items
+/skinmenu.import all                   # approved + pending (needs SteamWebApiKey)
+/skinmenu.import pending               # only un-approved workshop entries (needs SteamWebApiKey)
+```
+
+Available from chat (`/skinmenu.import ...`) and server / RCON
+console (`skinmenu.import ...`). Requires the `skinmenu.admin`
+permission (auto-passes for `IsAdmin` flagged players).
+
+Approved skins are read straight from `ItemSkinDirectory` and their
+workshop preview URLs come from the **public**
+`ISteamRemoteStorage/GetPublishedFileDetails` endpoint — no Steam API
+key required. To pull pending workshop submissions you need a free
+[Steam Web API key](https://steamcommunity.com/dev/apikey) saved in
+the config under `SteamWebApiKey`. Without it, `pending` / `all` fall
+back to `approved` (with a warning in chat / console).
+
+After the import finishes the new catalog is written to
+`oxide/data/SkinMenu/skins.json`, the in-memory catalog is hot-reloaded
+and all icon URLs are queued in `ImageLibrary`.
 
 ### Modes
 
