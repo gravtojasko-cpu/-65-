@@ -359,6 +359,31 @@ namespace Oxide.Plugins
             if (plugin?.Name == "ImageLibrary") RegisterRemoteImages();
         }
 
+        // Rust CUI has no native mouse-wheel events, so we hook the
+        // hotbar active-slot change instead: rolling the wheel cycles
+        // the active hotbar slot one step at a time (with 5 -> 0 / 0
+        // -> 5 wrap-around). Multi-step jumps (1-6 key presses) are
+        // ignored, so the player can still pick a specific slot
+        // without scrolling pages.
+        private void OnActiveItemChanged(BasePlayer player, Item oldItem, Item newItem)
+        {
+            if (player == null) return;
+            if (!_editors.TryGetValue(player.userID, out var st) || !st.MenuOpen) return;
+            if (!permission.UserHasPermission(player.UserIDString, PermUse)) return;
+
+            int oldSlot = oldItem?.position ?? -1;
+            int newSlot = newItem?.position ?? -1;
+            if (oldSlot < 0 || newSlot < 0 || oldSlot == newSlot) return;
+
+            int delta = newSlot - oldSlot;
+            int dir;
+            if (delta == 1 || delta == -5) dir = 1;
+            else if (delta == -1 || delta == 5) dir = -1;
+            else return; // multi-step change = key press, not wheel
+
+            HandlePage(player, dir);
+        }
+
         // -------------------------------------------------------------------
         // Image loading
         // -------------------------------------------------------------------
@@ -600,10 +625,31 @@ namespace Oxide.Plugins
         private void HandlePage(BasePlayer p, int delta)
         {
             var st = Editor(p);
-            var skins = FilterSkins(_catalog.Categories[st.CategoryIndex]);
+            if (_catalog.Categories.Count == 0) return;
             var perPage = Math.Max(1, _config.SkinsPerPage);
+            var skins = FilterSkins(_catalog.Categories[st.CategoryIndex]);
             var maxPage = Math.Max(0, (skins.Count - 1) / perPage);
-            st.Page = Mathf.Clamp(st.Page + delta, 0, maxPage);
+            var target = st.Page + delta;
+
+            if (target < 0 && st.CategoryIndex > 0)
+            {
+                // Step back into the previous category's last page.
+                st.CategoryIndex--;
+                var prevSkins = FilterSkins(_catalog.Categories[st.CategoryIndex]);
+                st.Page = Math.Max(0, (prevSkins.Count - 1) / perPage);
+                EnsureSelectedCategoryVisible(st);
+            }
+            else if (target > maxPage && st.CategoryIndex < _catalog.Categories.Count - 1)
+            {
+                // Step forward into the next category's first page.
+                st.CategoryIndex++;
+                st.Page = 0;
+                EnsureSelectedCategoryVisible(st);
+            }
+            else
+            {
+                st.Page = Mathf.Clamp(target, 0, maxPage);
+            }
             OpenMain(p);
         }
 
@@ -1253,25 +1299,9 @@ namespace Oxide.Plugins
                 }, slotName);
             }
 
-            // Pagination arrows.
-            const float arrowY = 0.30f;
-            AddStyledButton(elements, FramePanel, "\u25C0", "skinmenu.ui page -1",
-                gridLeft, arrowY, gridLeft + 0.04f, arrowY + 0.04f,
-                fontSize: 14);
-            AddStyledButton(elements, FramePanel, "\u25B6", "skinmenu.ui page 1",
-                gridRight - 0.04f, arrowY, gridRight, arrowY + 0.04f,
-                fontSize: 14);
-
-            elements.Add(new CuiLabel
-            {
-                Text =
-                {
-                    Text = $"{st.Page + 1} / {totalPages}",
-                    FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.85 0.85 0.85 1",
-                },
-                RectTransform = { AnchorMin = Coord(gridLeft + 0.05f, arrowY),
-                                  AnchorMax = Coord(gridRight - 0.05f, arrowY + 0.04f) },
-            }, FramePanel);
+            // Pagination is driven by the mouse wheel (see
+            // OnActiveItemChanged) - no on-screen arrows. The header
+            // still shows "page X/Y" so the player has feedback.
         }
 
         // Three buttons below the grid + active-set label.
