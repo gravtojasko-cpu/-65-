@@ -364,7 +364,8 @@ namespace Oxide.Plugins
         // the active hotbar slot one step at a time (with 5 -> 0 / 0
         // -> 5 wrap-around). Multi-step jumps (1-6 key presses) are
         // ignored, so the player can still pick a specific slot
-        // without scrolling pages.
+        // without scrolling categories. Wheel direction is forwarded
+        // to HandleCategoryScroll (left-hand category list).
         private void OnActiveItemChanged(BasePlayer player, Item oldItem, Item newItem)
         {
             if (player == null) return;
@@ -381,7 +382,7 @@ namespace Oxide.Plugins
             else if (delta == -1 || delta == 5) dir = -1;
             else return; // multi-step change = key press, not wheel
 
-            HandlePage(player, dir);
+            HandleCategoryScroll(player, dir);
         }
 
         // -------------------------------------------------------------------
@@ -959,6 +960,7 @@ namespace Oxide.Plugins
             BuildCategoryColumn(elements, st);
             BuildSkinGrid(elements, category, skins, st, perPage, totalPages);
             BuildActionButtons(elements, st);
+            BuildBottomPager(elements, st, totalPages);
             BuildFooter(elements);
 
             CuiHelper.AddUi(p, elements);
@@ -1299,9 +1301,33 @@ namespace Oxide.Plugins
                 }, slotName);
             }
 
-            // Pagination is driven by the mouse wheel (see
-            // OnActiveItemChanged) - no on-screen arrows. The header
-            // still shows "page X/Y" so the player has feedback.
+            // Pagination arrows live BELOW the action-buttons row
+            // (see BuildBottomPager) so they don't sit on top of
+            // the grid. The header still shows "page X/Y".
+        }
+
+        private void BuildBottomPager(CuiElementContainer elements, EditorState st, int totalPages)
+        {
+            const float left = 0.33f;
+            const float right = 0.97f;
+            const float top = 0.135f;
+            const float bot = 0.095f;
+
+            AddStyledButton(elements, FramePanel, "\u25C0", "skinmenu.ui page -1",
+                left, bot, left + 0.05f, top, fontSize: 14);
+            AddStyledButton(elements, FramePanel, "\u25B6", "skinmenu.ui page 1",
+                right - 0.05f, bot, right, top, fontSize: 14);
+
+            elements.Add(new CuiLabel
+            {
+                Text =
+                {
+                    Text = $"{st.Page + 1} / {totalPages}",
+                    FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.85 0.85 0.85 1",
+                },
+                RectTransform = { AnchorMin = Coord(left + 0.06f, bot),
+                                  AnchorMax = Coord(right - 0.06f, top) },
+            }, FramePanel);
         }
 
         // Three buttons below the grid + active-set label.
@@ -1312,8 +1338,8 @@ namespace Oxide.Plugins
 
             const float left = 0.33f;
             const float right = 0.97f;
-            const float top = 0.22f;
-            const float bot = 0.15f;
+            const float top = 0.250f;
+            const float bot = 0.180f;
             var width = (right - left) / labels.Length;
 
             for (var i = 0; i < labels.Length; i++)
@@ -1332,14 +1358,14 @@ namespace Oxide.Plugins
                     Text = "Active set: " + active, FontSize = 12,
                     Align = TextAnchor.MiddleCenter, Color = "0.85 0.85 0.85 1",
                 },
-                RectTransform = { AnchorMin = Coord(left, 0.105f), AnchorMax = Coord(right, 0.145f) },
+                RectTransform = { AnchorMin = Coord(left, 0.145f), AnchorMax = Coord(right, 0.175f) },
             }, FramePanel);
         }
 
         private void BuildFooter(CuiElementContainer elements)
         {
             AddStyledButton(elements, FramePanel, "All sets", "skinmenu.ui sets",
-                0.40f, 0.04f, 0.60f, 0.10f, fontSize: 13);
+                0.40f, 0.03f, 0.60f, 0.08f, fontSize: 13);
         }
 
         // -------------------------------------------------------------------
