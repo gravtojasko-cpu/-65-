@@ -100,28 +100,36 @@ o.grant group default skinmenu.use
 ```
 
 `Shortname` must match a Rust item shortname (e.g. `rifle.ak`,
-`hoodie`, `pants`, `metal.facemask`). Icons can be any HTTP(S) URL —
+`hoodie`, `pants`, `metal.facemask`). `Icon` is the category's image
+(shown next to the category name in the left-hand column of the menu),
+`IconUrl` is the per-skin icon. Icons can be any HTTP(S) URL —
 `ImageLibrary` caches them.
 
 ## Menu layout
 
 ```
-+--------------------------- SKIN MENU - AK-47 (1/3) -----[X]+
-|  [ AK-47 ] [ Hoodie ] [ Pants ] [ ... ]                    |
++----------- SKIN MENU ----------- AK-47 - page 1/3 -----[X]+
 |                                                            |
-|   +-------+  +-------+  +-------+  +-------+               |
-|   | skin  |  | skin  |  | skin  |  | skin  |               |
-|   +-------+  +-------+  +-------+  +-------+               |
-|   +-------+  +-------+  +-------+  +-------+               |
-|   | skin  |  | skin  |  | skin  |  | skin  |               |
-|   +-------+  +-------+  +-------+  +-------+               |
+|  +-------------+   +----+ +----+ +----+ +----+             |
+|  | [icon] AK   |   |    | |    | |    | |    |  ← square   |
+|  +-------------+   +----+ +----+ +----+ +----+    slots    |
+|  | [icon] Hood |                                           |
+|  +-------------+   +----+ +----+ +----+ +----+             |
+|  | [icon] Pant |   |    | |    | |    | |    |             |
+|  +-------------+   +----+ +----+ +----+ +----+             |
+|                       ◀   1 / 3   ▶                         |
 |                                                            |
-|   [ Create set ]  [ Save set ]  [ Enable set ]             |
-|              Active set: my-set                            |
+|     [Create set]   [Save set]   [Enable set]               |
+|                Active set: my-set                          |
 |                                                            |
-|                    [ All sets ]                            |
+|                     [All sets]                             |
 +------------------------------------------------------------+
 ```
+
+Categories live in a column on the **left** of the menu, each with
+its icon (loaded via `ImageLibrary`). The skin grid on the right shows
+the selected category's skins as square slots and pages with the
+bottom arrows.
 
 * **Create set** — opens a name prompt and stores the current
   selection.
@@ -135,7 +143,11 @@ o.grant group default skinmenu.use
 
 * Sets are stored at `oxide/data/SkinMenu/players/<steamid>.json` and
   can be edited offline.
-* If `ImageLibrary` is missing the menu still works — slot frames and
-  buttons fall back to flat colours, and icons are hidden.
+* If `ImageLibrary` is missing the menu still works — skin and
+  category icons are hidden but the rest of the UI renders with flat
+  colours.
+* The PNG design assets are loaded directly through Rust's
+  `FileStorage` (not through `ImageLibrary`), so they always render
+  correctly as long as the files exist in `oxide/data/SkinMenu/design/`.
 * A set named `default` is auto-applied on respawn when the
   `ApplyDefaultOnRespawn` config flag is on.
