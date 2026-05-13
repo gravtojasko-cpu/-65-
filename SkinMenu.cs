@@ -523,6 +523,10 @@ namespace Oxide.Plugins
                     HandlePage(player, arg.GetInt(1, 0));
                     break;
 
+                case "pageto":
+                    HandlePageTo(player, arg.GetInt(1, 0));
+                    break;
+
                 case "pick":
                     HandlePick(player, arg.GetString(1), arg.GetULong(2, 0));
                     break;
@@ -623,6 +627,10 @@ namespace Oxide.Plugins
             st.CategoryScroll = Mathf.Clamp(st.CategoryScroll, 0, maxScroll);
         }
 
+        // Wheel-driven delta paging: scrolls within the current
+        // category and wraps into adjacent categories at the edges.
+        // (Used only by OnActiveItemChanged today; the bottom arrows
+        //  call HandlePageTo with an absolute index and don't wrap.)
         private void HandlePage(BasePlayer p, int delta)
         {
             var st = Editor(p);
@@ -634,7 +642,6 @@ namespace Oxide.Plugins
 
             if (target < 0 && st.CategoryIndex > 0)
             {
-                // Step back into the previous category's last page.
                 st.CategoryIndex--;
                 var prevSkins = FilterSkins(_catalog.Categories[st.CategoryIndex]);
                 st.Page = Math.Max(0, (prevSkins.Count - 1) / perPage);
@@ -642,7 +649,6 @@ namespace Oxide.Plugins
             }
             else if (target > maxPage && st.CategoryIndex < _catalog.Categories.Count - 1)
             {
-                // Step forward into the next category's first page.
                 st.CategoryIndex++;
                 st.Page = 0;
                 EnsureSelectedCategoryVisible(st);
@@ -651,6 +657,19 @@ namespace Oxide.Plugins
             {
                 st.Page = Mathf.Clamp(target, 0, maxPage);
             }
+            OpenMain(p);
+        }
+
+        // Absolute paging used by the on-screen arrows (IQKits-style):
+        // clamps to [0, maxPage] within the current category, no wrap.
+        private void HandlePageTo(BasePlayer p, int index)
+        {
+            var st = Editor(p);
+            if (_catalog.Categories.Count == 0) return;
+            var perPage = Math.Max(1, _config.SkinsPerPage);
+            var skins = FilterSkins(_catalog.Categories[st.CategoryIndex]);
+            var maxPage = Math.Max(0, (skins.Count - 1) / perPage);
+            st.Page = Mathf.Clamp(index, 0, maxPage);
             OpenMain(p);
         }
 
@@ -1306,6 +1325,10 @@ namespace Oxide.Plugins
             // the grid. The header still shows "page X/Y".
         }
 
+        // IQKits-style pager: absolute-index commands + arrows that
+        // dim to 50% alpha when the player can't go further in that
+        // direction. The label uses "{current}/<size=10>{max}</size>"
+        // so the current page is visually emphasised.
         private void BuildBottomPager(CuiElementContainer elements, EditorState st, int totalPages)
         {
             const float left = 0.33f;
@@ -1313,21 +1336,47 @@ namespace Oxide.Plugins
             const float top = 0.135f;
             const float bot = 0.095f;
 
-            AddStyledButton(elements, FramePanel, "\u25C0", "skinmenu.ui page -1",
-                left, bot, left + 0.05f, top, fontSize: 14);
-            AddStyledButton(elements, FramePanel, "\u25B6", "skinmenu.ui page 1",
-                right - 0.05f, bot, right, top, fontSize: 14);
+            var atFirst = st.Page <= 0;
+            var atLast = st.Page >= totalPages - 1;
+
+            AddPagerButton(elements, FramePanel, "\u25C0",
+                atFirst ? "" : $"skinmenu.ui pageto {st.Page - 1}",
+                left, bot, left + 0.05f, top, dimmed: atFirst);
+            AddPagerButton(elements, FramePanel, "\u25B6",
+                atLast ? "" : $"skinmenu.ui pageto {st.Page + 1}",
+                right - 0.05f, bot, right, top, dimmed: atLast);
 
             elements.Add(new CuiLabel
             {
                 Text =
                 {
-                    Text = $"{st.Page + 1} / {totalPages}",
-                    FontSize = 11, Align = TextAnchor.MiddleCenter, Color = "0.85 0.85 0.85 1",
+                    Text = $"{st.Page + 1}/<size=10>{totalPages}</size>",
+                    FontSize = 16, Align = TextAnchor.MiddleCenter, Color = "0.89 0.85 0.82 1",
                 },
                 RectTransform = { AnchorMin = Coord(left + 0.06f, bot),
                                   AnchorMax = Coord(right - 0.06f, top) },
             }, FramePanel);
+        }
+
+        // Single pager arrow. Dimmed = half-alpha text, transparent
+        // button (click is a no-op because the caller passes an
+        // empty command).
+        private void AddPagerButton(CuiElementContainer elements, string parent,
+            string text, string command,
+            float xMin, float yMin, float xMax, float yMax, bool dimmed)
+        {
+            var color = dimmed ? "1 1 1 0.5" : "1 1 1 1";
+            elements.Add(new CuiButton
+            {
+                Button = { Color = ColTransparent, Command = command ?? string.Empty },
+                Text = { Text = text, FontSize = 18,
+                         Align = TextAnchor.MiddleCenter, Color = color },
+                RectTransform =
+                {
+                    AnchorMin = Coord(xMin, yMin),
+                    AnchorMax = Coord(xMax, yMax),
+                },
+            }, parent);
         }
 
         // Three buttons below the grid + active-set label.
