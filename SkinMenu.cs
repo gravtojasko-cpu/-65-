@@ -1595,34 +1595,43 @@ namespace Oxide.Plugins
             FetchIconsThenSave(admin, approved, mode);
         }
 
+        // Modern Rust builds expose `ItemSkinDirectory.Skin` as a
+        // bare struct with just `id` + `invItem` (no back-pointer to
+        // the parent `ItemDefinition`). The supported pattern is to
+        // walk every item definition and ask the directory for its
+        // skins via `ForItem(def)`.
         private List<ImportSkin> CollectApprovedSkins(HashSet<string> filter)
         {
             var result = new List<ImportSkin>();
-            var dir = ItemSkinDirectory.Instance;
-            if (dir == null || dir.skins == null) return result;
+            var defs = ItemManager.GetItemDefinitions();
+            if (defs == null) return result;
 
-            foreach (var s in dir.skins)
+            foreach (var def in defs)
             {
-                // ItemSkinDirectory.Skin is a struct in current builds,
-                // so a `s == null` check would not compile. The Item
-                // reference inside the struct is what we actually need
-                // to validate.
-                if (s.Item == null || s.Id == 0) continue;
-                var shortname = s.Item.shortname;
+                if (def == null) continue;
+                var shortname = def.shortname;
                 if (filter != null && !filter.Contains(shortname)) continue;
 
-                var skinName = s.invItem?.displayName?.english
-                               ?? s.invItem?.name
-                               ?? s.Id.ToString();
+                var skins = ItemSkinDirectory.ForItem(def);
+                if (skins == null) continue;
 
-                result.Add(new ImportSkin
+                foreach (var s in skins)
                 {
-                    SkinId = (ulong)s.Id,
-                    ItemShortname = shortname,
-                    ItemDisplay = s.Item.displayName?.english ?? shortname,
-                    Name = skinName,
-                    Approved = true,
-                });
+                    if (s.id == 0) continue;
+
+                    var skinName = s.invItem?.displayName?.english
+                                   ?? s.invItem?.name
+                                   ?? s.id.ToString();
+
+                    result.Add(new ImportSkin
+                    {
+                        SkinId = (ulong)s.id,
+                        ItemShortname = shortname,
+                        ItemDisplay = def.displayName?.english ?? shortname,
+                        Name = skinName,
+                        Approved = true,
+                    });
+                }
             }
             return result;
         }
