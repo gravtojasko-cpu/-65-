@@ -423,6 +423,14 @@ namespace Oxide.Plugins
         private string RemotePng(string key)
         {
             if (ImageLibrary == null) return null;
+            // HasImage avoids returning ImageLibrary's "NO IMAGE FOUND"
+            // placeholder while the icon is still downloading.
+            try
+            {
+                var ready = ImageLibrary.Call<bool>("HasImage", key, (ulong)0);
+                if (!ready) return null;
+            }
+            catch (Exception) { /* older ImageLibrary versions */ }
             var result = ImageLibrary.Call<string>("GetImage", key, (ulong)0, false);
             return string.IsNullOrEmpty(result) || result == "0" ? null : result;
         }
@@ -717,9 +725,13 @@ namespace Oxide.Plugins
             float xMin, float yMin, float xMax, float yMax,
             bool highlighted = false, string altColor = null, int fontSize = 13)
         {
-            // Optional design PNG underneath.
             var pngKey = highlighted ? "button_hl" : "button";
             var png = DesignPng(pngKey);
+
+            // When a custom design PNG is present, draw the PNG first
+            // and put the button overlay on top as a transparent click
+            // target so the design shows through.
+            string buttonColor;
             if (!string.IsNullOrEmpty(png))
             {
                 elements.Add(new CuiElement
@@ -735,12 +747,16 @@ namespace Oxide.Plugins
                         }
                     }
                 });
+                buttonColor = altColor ?? ColTransparent;
+            }
+            else
+            {
+                buttonColor = altColor ?? (highlighted ? ColAccent : "0.22 0.23 0.26 0.95");
             }
 
-            var color = altColor ?? (highlighted ? ColAccent : "0.22 0.23 0.26 0.95");
             elements.Add(new CuiButton
             {
-                Button = { Color = color, Command = command },
+                Button = { Color = buttonColor, Command = command },
                 Text = { Text = text ?? string.Empty, FontSize = fontSize,
                          Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
                 RectTransform =
@@ -913,44 +929,62 @@ namespace Oxide.Plugins
                 var rowName = FramePanel + ".cats.row" + i;
                 var active = i == st.CategoryIndex;
 
-                elements.Add(new CuiPanel
+                // Card background: design PNG if available, else flat colour.
+                var card = DesignPng(active ? "slot_active" : "slot");
+                if (!string.IsNullOrEmpty(card))
                 {
-                    Image = { Color = active ? ColAccentSoft : ColRow },
-                    RectTransform =
+                    elements.Add(new CuiElement
                     {
-                        AnchorMin = $"0.04 {rowBot}",
-                        AnchorMax = $"0.96 {rowTop - 0.005f}",
-                    },
-                }, FramePanel + ".cats", rowName);
-
-                // Icon on the left of the row (square within row).
-                var icon = RemotePng(CategoryImageKey(_catalog.Categories[i].Shortname));
-                if (!string.IsNullOrEmpty(icon))
-                {
-                    AddRawImage(elements, rowName, icon, 0.04f, 0.10f, 0.32f, 0.90f);
+                        Parent = FramePanel + ".cats",
+                        Name = rowName,
+                        Components =
+                        {
+                            new CuiRawImageComponent { Png = card, Color = "1 1 1 1" },
+                            new CuiRectTransformComponent
+                            {
+                                AnchorMin = $"0.04 {rowBot}",
+                                AnchorMax = $"0.96 {rowTop - 0.005f}",
+                            }
+                        }
+                    });
                 }
                 else
                 {
                     elements.Add(new CuiPanel
                     {
-                        Image = { Color = "0.10 0.10 0.12 0.6" },
+                        Image = { Color = active ? ColAccentSoft : ColRow },
                         RectTransform =
                         {
-                            AnchorMin = "0.04 0.10",
-                            AnchorMax = "0.32 0.90",
+                            AnchorMin = $"0.04 {rowBot}",
+                            AnchorMax = $"0.96 {rowTop - 0.005f}",
                         },
-                    }, rowName);
+                    }, FramePanel + ".cats", rowName);
                 }
 
-                // Display label.
+                // Icon on the left of the row when ImageLibrary has it.
+                var icon = RemotePng(CategoryImageKey(_catalog.Categories[i].Shortname));
+                var hasIcon = !string.IsNullOrEmpty(icon);
+                if (hasIcon)
+                {
+                    AddRawImage(elements, rowName, icon, 0.04f, 0.10f, 0.32f, 0.90f);
+                }
+
+                // Display label. Center it when there's no icon so the
+                // ImageLibrary "NO IMAGE FOUND" placeholder is never visible.
                 elements.Add(new CuiLabel
                 {
                     Text =
                     {
                         Text = _catalog.Categories[i].Display ?? _catalog.Categories[i].Shortname,
-                        FontSize = 13, Align = TextAnchor.MiddleLeft, Color = "1 1 1 1",
+                        FontSize = 13,
+                        Align = hasIcon ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
+                        Color = "1 1 1 1",
                     },
-                    RectTransform = { AnchorMin = "0.36 0", AnchorMax = "0.98 1" },
+                    RectTransform =
+                    {
+                        AnchorMin = hasIcon ? "0.36 0" : "0.05 0",
+                        AnchorMax = "0.98 1",
+                    },
                 }, rowName);
 
                 // Click-cover button.
